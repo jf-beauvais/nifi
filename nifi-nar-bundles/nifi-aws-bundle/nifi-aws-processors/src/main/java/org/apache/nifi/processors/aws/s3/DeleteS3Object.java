@@ -26,6 +26,9 @@ import com.amazonaws.services.s3.AmazonS3;
 import com.amazonaws.services.s3.model.DeleteObjectRequest;
 import com.amazonaws.services.s3.model.DeleteVersionRequest;
 
+import com.amazonaws.services.s3.model.ListVersionsRequest;
+import com.amazonaws.services.s3.model.S3VersionSummary;
+import com.amazonaws.services.s3.model.VersionListing;
 import org.apache.nifi.annotation.behavior.InputRequirement;
 import org.apache.nifi.annotation.behavior.InputRequirement.Requirement;
 import org.apache.nifi.annotation.behavior.SupportsBatching;
@@ -87,6 +90,13 @@ public class DeleteS3Object extends AbstractS3Processor {
                 final DeleteObjectRequest r = new DeleteObjectRequest(bucket, key);
                 // This call returns success if object doesn't exist
                 s3.deleteObject(r);
+            } else if (versionId.equals("*")) {
+                ListVersionsRequest versionRequest = new ListVersionsRequest().withBucketName(bucket).withPrefix(key);
+                VersionListing versions = s3.listVersions(versionRequest);
+                for (S3VersionSummary summary : versions.getVersionSummaries()){
+                    final DeleteVersionRequest r = new DeleteVersionRequest(bucket, key, summary.getVersionId());
+                    s3.deleteVersion(r);
+                }
             } else {
                 final DeleteVersionRequest r = new DeleteVersionRequest(bucket, key, versionId);
                 s3.deleteVersion(r);
