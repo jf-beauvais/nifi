@@ -25,6 +25,9 @@ import java.io.InputStream;
 import java.io.Serializable;
 import java.net.URLEncoder;
 import java.nio.file.Files;
+import java.security.DigestOutputStream;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.text.DateFormat;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
@@ -34,13 +37,19 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
+import java.util.Optional;
 import java.util.Properties;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 
+import com.amazonaws.services.s3.model.ListObjectsRequest;
+import com.amazonaws.services.s3.model.ListObjectsV2Request;
+import com.amazonaws.services.s3.model.ListObjectsV2Result;
 import com.amazonaws.services.s3.model.ObjectTagging;
+import com.amazonaws.services.s3.model.S3ObjectSummary;
 import com.amazonaws.services.s3.model.Tag;
 import org.apache.nifi.annotation.behavior.DynamicProperty;
 import org.apache.nifi.annotation.behavior.InputRequirement;
@@ -84,6 +93,8 @@ import com.amazonaws.services.s3.model.PutObjectResult;
 import com.amazonaws.services.s3.model.StorageClass;
 import com.amazonaws.services.s3.model.UploadPartRequest;
 import com.amazonaws.services.s3.model.UploadPartResult;
+import org.apache.nifi.stream.io.NullOutputStream;
+import org.apache.nifi.stream.io.StreamUtils;
 
 @SupportsBatching
 @SeeAlso({FetchS3Object.class, DeleteS3Object.class, ListS3.class})
@@ -230,9 +241,20 @@ public class PutS3Object extends AbstractS3Processor {
             .defaultValue("false")
             .build();
 
+    public static final PropertyDescriptor DO_NOT_OVERWRITE_ON_SAME_MD5 = new PropertyDescriptor.Builder()
+            .name("s3-object-do-not-overwrite-on-same-md5")
+            .displayName("Do not overwrite on same MD5")
+            .description("If set to 'True', the FlowFile MD5 hash will be computed and compare to the S3 object MD5 (metadata) if the object exists.  " +
+                    "If the MD5 are equal, the PUT object will be skipped. " +
+                    "NB: This property is effective on multipart objects. " +
+                    "This property avoids appending too much version in a versionned bucket, and it saves data transfer costs.")
+            .allowableValues(new AllowableValue("true", "True"), new AllowableValue("false", "False"))
+            .defaultValue("true")
+            .build();
+
     public static final List<PropertyDescriptor> properties = Collections.unmodifiableList(
         Arrays.asList(KEY, BUCKET, CONTENT_TYPE, ACCESS_KEY, SECRET_KEY, CREDENTIALS_FILE, AWS_CREDENTIALS_PROVIDER_SERVICE, OBJECT_TAGS_PREFIX, REMOVE_TAG_PREFIX,
-            STORAGE_CLASS, REGION, TIMEOUT, EXPIRATION_RULE_ID, FULL_CONTROL_USER_LIST, READ_USER_LIST, WRITE_USER_LIST, READ_ACL_LIST, WRITE_ACL_LIST, OWNER,
+            DO_NOT_OVERWRITE_ON_SAME_MD5, STORAGE_CLASS, REGION, TIMEOUT, EXPIRATION_RULE_ID, FULL_CONTROL_USER_LIST, READ_USER_LIST, WRITE_USER_LIST, READ_ACL_LIST, WRITE_ACL_LIST, OWNER,
             CANNED_ACL, SSL_CONTEXT_SERVICE, ENDPOINT_OVERRIDE, SIGNER_OVERRIDE, MULTIPART_THRESHOLD, MULTIPART_PART_SIZE, MULTIPART_S3_AGEOFF_INTERVAL,
             MULTIPART_S3_MAX_AGE, SERVER_SIDE_ENCRYPTION, PROXY_CONFIGURATION_SERVICE, PROXY_HOST, PROXY_HOST_PORT, PROXY_USERNAME, PROXY_PASSWORD));
 
@@ -430,6 +452,7 @@ public class PutS3Object extends AbstractS3Processor {
         final Long multipartPartSize = context.getProperty(MULTIPART_PART_SIZE).asDataSize(DataUnit.B).longValue();
 
         final long now = System.currentTimeMillis();
+        boolean isSkipPut = isSkipSameMd5(context, session, flowFile);
 
         /*
          * If necessary, run age off for existing uploads in AWS S3 and local state
@@ -441,285 +464,286 @@ public class PutS3Object extends AbstractS3Processor {
          */
         try {
             final FlowFile flowFileCopy = flowFile;
-            session.read(flowFile, new InputStreamCallback() {
-                @Override
-                public void process(final InputStream rawIn) throws IOException {
-                    try (final InputStream in = new BufferedInputStream(rawIn)) {
-                        final ObjectMetadata objectMetadata = new ObjectMetadata();
-                        objectMetadata.setContentDisposition(URLEncoder.encode(ff.getAttribute(CoreAttributes.FILENAME.key()), "UTF-8"));
-                        objectMetadata.setContentLength(ff.getSize());
+            if (!isSkipPut) {
+                session.read(flowFile, new InputStreamCallback() {
+                    @Override
+                    public void process(final InputStream rawIn) throws IOException {
+                        try (final InputStream in = new BufferedInputStream(rawIn)) {
+                            final ObjectMetadata objectMetadata = new ObjectMetadata();
+                            objectMetadata.setContentDisposition(URLEncoder.encode(ff.getAttribute(CoreAttributes.FILENAME.key()), "UTF-8"));
+                            objectMetadata.setContentLength(ff.getSize());
 
-                        final String contentType = context.getProperty(CONTENT_TYPE)
-                                .evaluateAttributeExpressions(ff).getValue();
-                        if (contentType != null) {
-                            objectMetadata.setContentType(contentType);
-                            attributes.put(S3_CONTENT_TYPE, contentType);
-                        }
-
-                        final String expirationRule = context.getProperty(EXPIRATION_RULE_ID)
-                                .evaluateAttributeExpressions(ff).getValue();
-                        if (expirationRule != null) {
-                            objectMetadata.setExpirationTimeRuleId(expirationRule);
-                        }
-
-                        final Map<String, String> userMetadata = new HashMap<>();
-                        for (final Map.Entry<PropertyDescriptor, String> entry : context.getProperties().entrySet()) {
-                            if (entry.getKey().isDynamic()) {
-                                final String value = context.getProperty(
-                                        entry.getKey()).evaluateAttributeExpressions(ff).getValue();
-                                userMetadata.put(entry.getKey().getName(), value);
-                            }
-                        }
-
-                        final String serverSideEncryption = context.getProperty(SERVER_SIDE_ENCRYPTION).getValue();
-                        if (!serverSideEncryption.equals(NO_SERVER_SIDE_ENCRYPTION)) {
-                            objectMetadata.setSSEAlgorithm(serverSideEncryption);
-                            attributes.put(S3_SSE_ALGORITHM, serverSideEncryption);
-                        }
-
-                        if (!userMetadata.isEmpty()) {
-                            objectMetadata.setUserMetadata(userMetadata);
-                        }
-
-                        if (ff.getSize() <= multipartThreshold) {
-                            //----------------------------------------
-                            // single part upload
-                            //----------------------------------------
-                            final PutObjectRequest request = new PutObjectRequest(bucket, key, in, objectMetadata);
-                            request.setStorageClass(
-                                    StorageClass.valueOf(context.getProperty(STORAGE_CLASS).getValue()));
-                            final AccessControlList acl = createACL(context, ff);
-                            if (acl != null) {
-                                request.setAccessControlList(acl);
-                            }
-                            final CannedAccessControlList cannedAcl = createCannedACL(context, ff);
-                            if (cannedAcl != null) {
-                                request.withCannedAcl(cannedAcl);
+                            final String contentType = context.getProperty(CONTENT_TYPE)
+                                    .evaluateAttributeExpressions(ff).getValue();
+                            if (contentType != null) {
+                                objectMetadata.setContentType(contentType);
+                                attributes.put(S3_CONTENT_TYPE, contentType);
                             }
 
-                            if (context.getProperty(OBJECT_TAGS_PREFIX).isSet()) {
-                                request.setTagging(new ObjectTagging(getObjectTags(context, flowFileCopy)));
+                            final String expirationRule = context.getProperty(EXPIRATION_RULE_ID)
+                                    .evaluateAttributeExpressions(ff).getValue();
+                            if (expirationRule != null) {
+                                objectMetadata.setExpirationTimeRuleId(expirationRule);
                             }
 
-                            try {
-                                final PutObjectResult result = s3.putObject(request);
-                                if (result.getVersionId() != null) {
-                                    attributes.put(S3_VERSION_ATTR_KEY, result.getVersionId());
+                            final Map<String, String> userMetadata = new HashMap<>();
+                            for (final Map.Entry<PropertyDescriptor, String> entry : context.getProperties().entrySet()) {
+                                if (entry.getKey().isDynamic()) {
+                                    final String value = context.getProperty(
+                                            entry.getKey()).evaluateAttributeExpressions(ff).getValue();
+                                    userMetadata.put(entry.getKey().getName(), value);
                                 }
-                                if (result.getETag() != null) {
-                                    attributes.put(S3_ETAG_ATTR_KEY, result.getETag());
-                                }
-                                if (result.getExpirationTime() != null) {
-                                    attributes.put(S3_EXPIRATION_ATTR_KEY, result.getExpirationTime().toString());
-                                }
-                                if (result.getMetadata().getRawMetadata().keySet().contains(S3_STORAGECLASS_META_KEY)) {
-                                    attributes.put(S3_STORAGECLASS_ATTR_KEY,
-                                            result.getMetadata().getRawMetadataValue(S3_STORAGECLASS_META_KEY).toString());
-                                }
-                                if (userMetadata.size() > 0) {
-                                    StringBuilder userMetaBldr = new StringBuilder();
-                                    for (String userKey : userMetadata.keySet()) {
-                                        userMetaBldr.append(userKey).append("=").append(userMetadata.get(userKey));
-                                    }
-                                    attributes.put(S3_USERMETA_ATTR_KEY, userMetaBldr.toString());
-                                }
-                                attributes.put(S3_API_METHOD_ATTR_KEY, S3_API_METHOD_PUTOBJECT);
-                            } catch (AmazonClientException e) {
-                                getLogger().info("Failure completing upload flowfile={} bucket={} key={} reason={}",
-                                        new Object[]{ffFilename, bucket, key, e.getMessage()});
-                                throw (e);
-                            }
-                        } else {
-                            //----------------------------------------
-                            // multipart upload
-                            //----------------------------------------
-
-                            // load or create persistent state
-                            //------------------------------------------------------------
-                            MultipartState currentState;
-                            try {
-                                currentState = getLocalStateIfInS3(s3, bucket, cacheKey);
-                                if (currentState != null) {
-                                    if (currentState.getPartETags().size() > 0) {
-                                        final PartETag lastETag = currentState.getPartETags().get(
-                                                currentState.getPartETags().size() - 1);
-                                        getLogger().info("Resuming upload for flowfile='{}' bucket='{}' key='{}' " +
-                                                "uploadID='{}' filePosition='{}' partSize='{}' storageClass='{}' " +
-                                                "contentLength='{}' partsLoaded={} lastPart={}/{}",
-                                                new Object[]{ffFilename, bucket, key, currentState.getUploadId(),
-                                                        currentState.getFilePosition(), currentState.getPartSize(),
-                                                        currentState.getStorageClass().toString(),
-                                                        currentState.getContentLength(),
-                                                        currentState.getPartETags().size(),
-                                                        Integer.toString(lastETag.getPartNumber()),
-                                                        lastETag.getETag()});
-                                    } else {
-                                        getLogger().info("Resuming upload for flowfile='{}' bucket='{}' key='{}' " +
-                                                "uploadID='{}' filePosition='{}' partSize='{}' storageClass='{}' " +
-                                                "contentLength='{}' no partsLoaded",
-                                                new Object[]{ffFilename, bucket, key, currentState.getUploadId(),
-                                                        currentState.getFilePosition(), currentState.getPartSize(),
-                                                        currentState.getStorageClass().toString(),
-                                                        currentState.getContentLength()});
-                                    }
-                                } else {
-                                    currentState = new MultipartState();
-                                    currentState.setPartSize(multipartPartSize);
-                                    currentState.setStorageClass(
-                                            StorageClass.valueOf(context.getProperty(STORAGE_CLASS).getValue()));
-                                    currentState.setContentLength(ff.getSize());
-                                    persistLocalState(cacheKey, currentState);
-                                    getLogger().info("Starting new upload for flowfile='{}' bucket='{}' key='{}'",
-                                            new Object[]{ffFilename, bucket, key});
-                                }
-                            } catch (IOException e) {
-                                getLogger().error("IOException initiating cache state while processing flow files: " +
-                                        e.getMessage());
-                                throw (e);
                             }
 
-                            // initiate multipart upload or find position in file
-                            //------------------------------------------------------------
-                            if (currentState.getUploadId().isEmpty()) {
-                                final InitiateMultipartUploadRequest initiateRequest =
-                                        new InitiateMultipartUploadRequest(bucket, key, objectMetadata);
-                                initiateRequest.setStorageClass(currentState.getStorageClass());
+                            final String serverSideEncryption = context.getProperty(SERVER_SIDE_ENCRYPTION).getValue();
+                            if (!serverSideEncryption.equals(NO_SERVER_SIDE_ENCRYPTION)) {
+                                objectMetadata.setSSEAlgorithm(serverSideEncryption);
+                                attributes.put(S3_SSE_ALGORITHM, serverSideEncryption);
+                            }
+
+                            if (!userMetadata.isEmpty()) {
+                                objectMetadata.setUserMetadata(userMetadata);
+                            }
+
+                            if (ff.getSize() <= multipartThreshold) {
+                                //----------------------------------------
+                                // single part upload
+                                //----------------------------------------
+                                final PutObjectRequest request = new PutObjectRequest(bucket, key, in, objectMetadata);
+                                request.setStorageClass(
+                                        StorageClass.valueOf(context.getProperty(STORAGE_CLASS).getValue()));
                                 final AccessControlList acl = createACL(context, ff);
                                 if (acl != null) {
-                                    initiateRequest.setAccessControlList(acl);
+                                    request.setAccessControlList(acl);
                                 }
                                 final CannedAccessControlList cannedAcl = createCannedACL(context, ff);
                                 if (cannedAcl != null) {
-                                    initiateRequest.withCannedACL(cannedAcl);
+                                    request.withCannedAcl(cannedAcl);
                                 }
 
                                 if (context.getProperty(OBJECT_TAGS_PREFIX).isSet()) {
-                                    initiateRequest.setTagging(new ObjectTagging(getObjectTags(context, flowFileCopy)));
+                                    request.setTagging(new ObjectTagging(getObjectTags(context, flowFileCopy)));
                                 }
 
                                 try {
-                                    final InitiateMultipartUploadResult initiateResult =
-                                            s3.initiateMultipartUpload(initiateRequest);
-                                    currentState.setUploadId(initiateResult.getUploadId());
-                                    currentState.getPartETags().clear();
-                                    try {
-                                        persistLocalState(cacheKey, currentState);
-                                    } catch (Exception e) {
-                                        getLogger().info("Exception saving cache state while processing flow file: " +
-                                                e.getMessage());
-                                        throw(new ProcessException("Exception saving cache state", e));
+                                    final PutObjectResult result = s3.putObject(request);
+                                    if (result.getVersionId() != null) {
+                                        attributes.put(S3_VERSION_ATTR_KEY, result.getVersionId());
                                     }
-                                    getLogger().info("Success initiating upload flowfile={} available={} position={} " +
-                                            "length={} bucket={} key={} uploadId={}",
-                                            new Object[]{ffFilename, in.available(), currentState.getFilePosition(),
-                                                    currentState.getContentLength(), bucket, key,
-                                                    currentState.getUploadId()});
-                                    if (initiateResult.getUploadId() != null) {
-                                        attributes.put(S3_UPLOAD_ID_ATTR_KEY, initiateResult.getUploadId());
+                                    if (result.getETag() != null) {
+                                        attributes.put(S3_ETAG_ATTR_KEY, result.getETag());
                                     }
+                                    if (result.getExpirationTime() != null) {
+                                        attributes.put(S3_EXPIRATION_ATTR_KEY, result.getExpirationTime().toString());
+                                    }
+                                    if (result.getMetadata().getRawMetadata().keySet().contains(S3_STORAGECLASS_META_KEY)) {
+                                        attributes.put(S3_STORAGECLASS_ATTR_KEY,
+                                                result.getMetadata().getRawMetadataValue(S3_STORAGECLASS_META_KEY).toString());
+                                    }
+                                    if (userMetadata.size() > 0) {
+                                        StringBuilder userMetaBldr = new StringBuilder();
+                                        for (String userKey : userMetadata.keySet()) {
+                                            userMetaBldr.append(userKey).append("=").append(userMetadata.get(userKey));
+                                        }
+                                        attributes.put(S3_USERMETA_ATTR_KEY, userMetaBldr.toString());
+                                    }
+                                    attributes.put(S3_API_METHOD_ATTR_KEY, S3_API_METHOD_PUTOBJECT);
                                 } catch (AmazonClientException e) {
-                                    getLogger().info("Failure initiating upload flowfile={} bucket={} key={} reason={}",
+                                    getLogger().info("Failure completing upload flowfile={} bucket={} key={} reason={}",
                                             new Object[]{ffFilename, bucket, key, e.getMessage()});
-                                    throw(e);
+                                    throw (e);
                                 }
                             } else {
-                                if (currentState.getFilePosition() > 0) {
-                                    try {
-                                        final long skipped = in.skip(currentState.getFilePosition());
-                                        if (skipped != currentState.getFilePosition()) {
-                                            getLogger().info("Failure skipping to resume upload flowfile={} " +
-                                                    "bucket={} key={} position={} skipped={}",
-                                                    new Object[]{ffFilename, bucket, key,
-                                                            currentState.getFilePosition(), skipped});
-                                        }
-                                    } catch (Exception e) {
-                                        getLogger().info("Failure skipping to resume upload flowfile={} bucket={} " +
-                                                "key={} position={} reason={}",
-                                                new Object[]{ffFilename, bucket, key, currentState.getFilePosition(),
-                                                        e.getMessage()});
-                                        throw(new ProcessException(e));
-                                    }
-                                }
-                            }
+                                //----------------------------------------
+                                // multipart upload
+                                //----------------------------------------
 
-                            // upload parts
-                            //------------------------------------------------------------
-                            long thisPartSize;
-                            for (int part = currentState.getPartETags().size() + 1;
-                                 currentState.getFilePosition() < currentState.getContentLength(); part++) {
-                                if (!PutS3Object.this.isScheduled()) {
-                                    throw new IOException(S3_PROCESS_UNSCHEDULED_MESSAGE + " flowfile=" + ffFilename +
-                                            " part=" + part + " uploadId=" + currentState.getUploadId());
-                                }
-                                thisPartSize = Math.min(currentState.getPartSize(),
-                                        (currentState.getContentLength() - currentState.getFilePosition()));
-                                UploadPartRequest uploadRequest = new UploadPartRequest()
-                                        .withBucketName(bucket)
-                                        .withKey(key)
-                                        .withUploadId(currentState.getUploadId())
-                                        .withInputStream(in)
-                                        .withPartNumber(part)
-                                        .withPartSize(thisPartSize);
+                                // load or create persistent state
+                                //------------------------------------------------------------
+                                MultipartState currentState;
                                 try {
-                                    UploadPartResult uploadPartResult = s3.uploadPart(uploadRequest);
-                                    currentState.addPartETag(uploadPartResult.getPartETag());
-                                    currentState.setFilePosition(currentState.getFilePosition() + thisPartSize);
-                                    try {
+                                    currentState = getLocalStateIfInS3(s3, bucket, cacheKey);
+                                    if (currentState != null) {
+                                        if (currentState.getPartETags().size() > 0) {
+                                            final PartETag lastETag = currentState.getPartETags().get(
+                                                    currentState.getPartETags().size() - 1);
+                                            getLogger().info("Resuming upload for flowfile='{}' bucket='{}' key='{}' " +
+                                                            "uploadID='{}' filePosition='{}' partSize='{}' storageClass='{}' " +
+                                                            "contentLength='{}' partsLoaded={} lastPart={}/{}",
+                                                    new Object[]{ffFilename, bucket, key, currentState.getUploadId(),
+                                                            currentState.getFilePosition(), currentState.getPartSize(),
+                                                            currentState.getStorageClass().toString(),
+                                                            currentState.getContentLength(),
+                                                            currentState.getPartETags().size(),
+                                                            Integer.toString(lastETag.getPartNumber()),
+                                                            lastETag.getETag()});
+                                        } else {
+                                            getLogger().info("Resuming upload for flowfile='{}' bucket='{}' key='{}' " +
+                                                            "uploadID='{}' filePosition='{}' partSize='{}' storageClass='{}' " +
+                                                            "contentLength='{}' no partsLoaded",
+                                                    new Object[]{ffFilename, bucket, key, currentState.getUploadId(),
+                                                            currentState.getFilePosition(), currentState.getPartSize(),
+                                                            currentState.getStorageClass().toString(),
+                                                            currentState.getContentLength()});
+                                        }
+                                    } else {
+                                        currentState = new MultipartState();
+                                        currentState.setPartSize(multipartPartSize);
+                                        currentState.setStorageClass(
+                                                StorageClass.valueOf(context.getProperty(STORAGE_CLASS).getValue()));
+                                        currentState.setContentLength(ff.getSize());
                                         persistLocalState(cacheKey, currentState);
-                                    } catch (Exception e) {
-                                        getLogger().info("Exception saving cache state processing flow file: " +
-                                                e.getMessage());
+                                        getLogger().info("Starting new upload for flowfile='{}' bucket='{}' key='{}'",
+                                                new Object[]{ffFilename, bucket, key});
                                     }
-                                    getLogger().info("Success uploading part flowfile={} part={} available={} " +
-                                            "etag={} uploadId={}", new Object[]{ffFilename, part, in.available(),
-                                            uploadPartResult.getETag(), currentState.getUploadId()});
+                                } catch (IOException e) {
+                                    getLogger().error("IOException initiating cache state while processing flow files: " +
+                                            e.getMessage());
+                                    throw (e);
+                                }
+
+                                // initiate multipart upload or find position in file
+                                //------------------------------------------------------------
+                                if (currentState.getUploadId().isEmpty()) {
+                                    final InitiateMultipartUploadRequest initiateRequest =
+                                            new InitiateMultipartUploadRequest(bucket, key, objectMetadata);
+                                    initiateRequest.setStorageClass(currentState.getStorageClass());
+                                    final AccessControlList acl = createACL(context, ff);
+                                    if (acl != null) {
+                                        initiateRequest.setAccessControlList(acl);
+                                    }
+                                    final CannedAccessControlList cannedAcl = createCannedACL(context, ff);
+                                    if (cannedAcl != null) {
+                                        initiateRequest.withCannedACL(cannedAcl);
+                                    }
+
+                                    if (context.getProperty(OBJECT_TAGS_PREFIX).isSet()) {
+                                        initiateRequest.setTagging(new ObjectTagging(getObjectTags(context, flowFileCopy)));
+                                    }
+
+                                    try {
+                                        final InitiateMultipartUploadResult initiateResult =
+                                                s3.initiateMultipartUpload(initiateRequest);
+                                        currentState.setUploadId(initiateResult.getUploadId());
+                                        currentState.getPartETags().clear();
+                                        try {
+                                            persistLocalState(cacheKey, currentState);
+                                        } catch (Exception e) {
+                                            getLogger().info("Exception saving cache state while processing flow file: " +
+                                                    e.getMessage());
+                                            throw (new ProcessException("Exception saving cache state", e));
+                                        }
+                                        getLogger().info("Success initiating upload flowfile={} available={} position={} " +
+                                                        "length={} bucket={} key={} uploadId={}",
+                                                new Object[]{ffFilename, in.available(), currentState.getFilePosition(),
+                                                        currentState.getContentLength(), bucket, key,
+                                                        currentState.getUploadId()});
+                                        if (initiateResult.getUploadId() != null) {
+                                            attributes.put(S3_UPLOAD_ID_ATTR_KEY, initiateResult.getUploadId());
+                                        }
+                                    } catch (AmazonClientException e) {
+                                        getLogger().info("Failure initiating upload flowfile={} bucket={} key={} reason={}",
+                                                new Object[]{ffFilename, bucket, key, e.getMessage()});
+                                        throw (e);
+                                    }
+                                } else {
+                                    if (currentState.getFilePosition() > 0) {
+                                        try {
+                                            final long skipped = in.skip(currentState.getFilePosition());
+                                            if (skipped != currentState.getFilePosition()) {
+                                                getLogger().info("Failure skipping to resume upload flowfile={} " +
+                                                                "bucket={} key={} position={} skipped={}",
+                                                        new Object[]{ffFilename, bucket, key,
+                                                                currentState.getFilePosition(), skipped});
+                                            }
+                                        } catch (Exception e) {
+                                            getLogger().info("Failure skipping to resume upload flowfile={} bucket={} " +
+                                                            "key={} position={} reason={}",
+                                                    new Object[]{ffFilename, bucket, key, currentState.getFilePosition(),
+                                                            e.getMessage()});
+                                            throw (new ProcessException(e));
+                                        }
+                                    }
+                                }
+
+                                // upload parts
+                                //------------------------------------------------------------
+                                long thisPartSize;
+                                for (int part = currentState.getPartETags().size() + 1;
+                                     currentState.getFilePosition() < currentState.getContentLength(); part++) {
+                                    if (!PutS3Object.this.isScheduled()) {
+                                        throw new IOException(S3_PROCESS_UNSCHEDULED_MESSAGE + " flowfile=" + ffFilename +
+                                                " part=" + part + " uploadId=" + currentState.getUploadId());
+                                    }
+                                    thisPartSize = Math.min(currentState.getPartSize(),
+                                            (currentState.getContentLength() - currentState.getFilePosition()));
+                                    UploadPartRequest uploadRequest = new UploadPartRequest()
+                                            .withBucketName(bucket)
+                                            .withKey(key)
+                                            .withUploadId(currentState.getUploadId())
+                                            .withInputStream(in)
+                                            .withPartNumber(part)
+                                            .withPartSize(thisPartSize);
+                                    try {
+                                        UploadPartResult uploadPartResult = s3.uploadPart(uploadRequest);
+                                        currentState.addPartETag(uploadPartResult.getPartETag());
+                                        currentState.setFilePosition(currentState.getFilePosition() + thisPartSize);
+                                        try {
+                                            persistLocalState(cacheKey, currentState);
+                                        } catch (Exception e) {
+                                            getLogger().info("Exception saving cache state processing flow file: " +
+                                                    e.getMessage());
+                                        }
+                                        getLogger().info("Success uploading part flowfile={} part={} available={} " +
+                                                "etag={} uploadId={}", new Object[]{ffFilename, part, in.available(),
+                                                uploadPartResult.getETag(), currentState.getUploadId()});
+                                    } catch (AmazonClientException e) {
+                                        getLogger().info("Failure uploading part flowfile={} part={} bucket={} key={} " +
+                                                "reason={}", new Object[]{ffFilename, part, bucket, key, e.getMessage()});
+                                        throw (e);
+                                    }
+                                }
+
+                                // complete multipart upload
+                                //------------------------------------------------------------
+                                CompleteMultipartUploadRequest completeRequest = new CompleteMultipartUploadRequest(
+                                        bucket, key, currentState.getUploadId(), currentState.getPartETags());
+                                try {
+                                    CompleteMultipartUploadResult completeResult =
+                                            s3.completeMultipartUpload(completeRequest);
+                                    getLogger().info("Success completing upload flowfile={} etag={} uploadId={}",
+                                            new Object[]{ffFilename, completeResult.getETag(), currentState.getUploadId()});
+                                    if (completeResult.getVersionId() != null) {
+                                        attributes.put(S3_VERSION_ATTR_KEY, completeResult.getVersionId());
+                                    }
+                                    if (completeResult.getETag() != null) {
+                                        attributes.put(S3_ETAG_ATTR_KEY, completeResult.getETag());
+                                    }
+                                    if (completeResult.getExpirationTime() != null) {
+                                        attributes.put(S3_EXPIRATION_ATTR_KEY,
+                                                completeResult.getExpirationTime().toString());
+                                    }
+                                    if (currentState.getStorageClass() != null) {
+                                        attributes.put(S3_STORAGECLASS_ATTR_KEY, currentState.getStorageClass().toString());
+                                    }
+                                    if (userMetadata.size() > 0) {
+                                        StringBuilder userMetaBldr = new StringBuilder();
+                                        for (String userKey : userMetadata.keySet()) {
+                                            userMetaBldr.append(userKey).append("=").append(userMetadata.get(userKey));
+                                        }
+                                        attributes.put(S3_USERMETA_ATTR_KEY, userMetaBldr.toString());
+                                    }
+                                    attributes.put(S3_API_METHOD_ATTR_KEY, S3_API_METHOD_MULTIPARTUPLOAD);
                                 } catch (AmazonClientException e) {
-                                    getLogger().info("Failure uploading part flowfile={} part={} bucket={} key={} " +
-                                            "reason={}", new Object[]{ffFilename, part, bucket, key, e.getMessage()});
+                                    getLogger().info("Failure completing upload flowfile={} bucket={} key={} reason={}",
+                                            new Object[]{ffFilename, bucket, key, e.getMessage()});
                                     throw (e);
                                 }
                             }
-
-                            // complete multipart upload
-                            //------------------------------------------------------------
-                            CompleteMultipartUploadRequest completeRequest = new CompleteMultipartUploadRequest(
-                                    bucket, key, currentState.getUploadId(), currentState.getPartETags());
-                            try {
-                                CompleteMultipartUploadResult completeResult =
-                                        s3.completeMultipartUpload(completeRequest);
-                                getLogger().info("Success completing upload flowfile={} etag={} uploadId={}",
-                                        new Object[]{ffFilename, completeResult.getETag(), currentState.getUploadId()});
-                                if (completeResult.getVersionId() != null) {
-                                    attributes.put(S3_VERSION_ATTR_KEY, completeResult.getVersionId());
-                                }
-                                if (completeResult.getETag() != null) {
-                                    attributes.put(S3_ETAG_ATTR_KEY, completeResult.getETag());
-                                }
-                                if (completeResult.getExpirationTime() != null) {
-                                    attributes.put(S3_EXPIRATION_ATTR_KEY,
-                                            completeResult.getExpirationTime().toString());
-                                }
-                                if (currentState.getStorageClass() != null) {
-                                    attributes.put(S3_STORAGECLASS_ATTR_KEY, currentState.getStorageClass().toString());
-                                }
-                                if (userMetadata.size() > 0) {
-                                    StringBuilder userMetaBldr = new StringBuilder();
-                                    for (String userKey : userMetadata.keySet()) {
-                                        userMetaBldr.append(userKey).append("=").append(userMetadata.get(userKey));
-                                    }
-                                    attributes.put(S3_USERMETA_ATTR_KEY, userMetaBldr.toString());
-                                }
-                                attributes.put(S3_API_METHOD_ATTR_KEY, S3_API_METHOD_MULTIPARTUPLOAD);
-                            } catch (AmazonClientException e) {
-                                getLogger().info("Failure completing upload flowfile={} bucket={} key={} reason={}",
-                                        new Object[]{ffFilename, bucket, key, e.getMessage()});
-                                throw (e);
-                            }
                         }
                     }
-                }
-            });
-
+                });
+            }
             if (!attributes.isEmpty()) {
                 flowFile = session.putAllAttributes(flowFile, attributes);
             }
@@ -747,6 +771,43 @@ public class PutS3Object extends AbstractS3Processor {
             }
         }
 
+    }
+
+    private boolean isSkipSameMd5(ProcessContext context, ProcessSession session, FlowFile flowFile) {
+        if (!context.getProperty(DO_NOT_OVERWRITE_ON_SAME_MD5).asBoolean()) {
+            return false;
+        }
+        final String bucket = context.getProperty(BUCKET).evaluateAttributeExpressions(flowFile).getValue();
+        final String key = context.getProperty(KEY).evaluateAttributeExpressions(flowFile).getValue();
+        final AtomicReference<String> hashValueHolder = new AtomicReference<>(null);
+        session.read(flowFile, in -> {
+            try {
+                MessageDigest digest = MessageDigest.getInstance("MD5");
+                try (final DigestOutputStream digestOut = new DigestOutputStream(new NullOutputStream(), digest)) {
+                    StreamUtils.copy(in, digestOut);
+
+                    final byte[] hash = digest.digest();
+                    final StringBuilder strb = new StringBuilder(hash.length * 2);
+                    for (byte b : hash) {
+                        strb.append(Integer.toHexString((b & 0xFF) | 0x100), 1, 3);
+                    }
+                    hashValueHolder.set(strb.toString());
+
+                }
+            } catch (NoSuchAlgorithmException e) {
+                getLogger().error("Cannot compute MD5 hash", e);
+            }
+        });
+
+        ListObjectsV2Request listObjectsRequest = new ListObjectsV2Request().withBucketName(bucket);
+        listObjectsRequest.setPrefix(key);
+        ListObjectsV2Result objectListing = client.listObjectsV2(listObjectsRequest);
+        Optional<String> etag = objectListing.getObjectSummaries().stream().map(S3ObjectSummary::getETag).findFirst();
+        boolean skip = etag.map(t -> t.equals(hashValueHolder.get())).orElse(false);
+        if (skip){
+            getLogger().info("Same MD5, skipping PutS3");
+        }
+        return skip;
     }
 
     private final Lock s3BucketLock = new ReentrantLock();
