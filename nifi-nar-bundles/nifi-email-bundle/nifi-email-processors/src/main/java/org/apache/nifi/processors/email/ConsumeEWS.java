@@ -74,6 +74,7 @@ import java.io.IOException;
 import java.io.OutputStream;
 import java.net.URI;
 import java.net.URISyntaxException;
+import java.security.GeneralSecurityException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashSet;
@@ -270,7 +271,13 @@ public class ConsumeEWS extends AbstractProcessor {
 
     protected ExchangeService initializeIfNecessary(ProcessContext context) throws ProcessException {
         ExchangeVersion ver = ExchangeVersion.valueOf(context.getProperty(EXCHANGE_VERSION).getValue());
-        ExchangeService service = new ExchangeService(ver);
+        ExchangeService service;
+        try {
+            // TODO use SSL_CONTEXT_SERVICE property
+            service = new ExchangeServiceSSL(ver);
+        } catch (GeneralSecurityException e) {
+            throw new ProcessException("Failure initializing EWS Service.", e);
+        }
 
         final String timeoutInMillis = String.valueOf(context.getProperty(CONNECTION_TIMEOUT).evaluateAttributeExpressions().asTimePeriod(TimeUnit.MILLISECONDS));
         service.setTimeout(Integer.parseInt(timeoutInMillis));
