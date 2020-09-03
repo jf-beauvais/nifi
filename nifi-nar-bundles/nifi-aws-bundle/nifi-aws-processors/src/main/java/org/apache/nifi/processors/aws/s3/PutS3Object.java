@@ -747,7 +747,11 @@ public class PutS3Object extends AbstractS3Processor {
             if (!attributes.isEmpty()) {
                 flowFile = session.putAllAttributes(flowFile, attributes);
             }
-            session.transfer(flowFile, REL_SUCCESS);
+            if (!isSkipPut) {
+                session.transfer(flowFile, REL_SUCCESS);
+            } else {
+                session.transfer(flowFile, REL_SKIPPED);
+            }
 
             final String url = s3.getResourceUrl(bucket, key);
             final long millis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos);

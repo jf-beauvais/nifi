@@ -71,11 +71,13 @@ public abstract class AbstractAWSProcessor<ClientType extends AmazonWebServiceCl
 
     public static final Relationship REL_SUCCESS = new Relationship.Builder().name("success")
             .description("FlowFiles are routed to success relationship").build();
+    public static final Relationship REL_SKIPPED = new Relationship.Builder().name("skipped")
+            .description("FlowFiles are routed to skipped relationship").build();
     public static final Relationship REL_FAILURE = new Relationship.Builder().name("failure")
             .description("FlowFiles are routed to failure relationship").build();
 
     public static final Set<Relationship> relationships = Collections.unmodifiableSet(
-            new HashSet<>(Arrays.asList(REL_SUCCESS, REL_FAILURE)));
+            new HashSet<>(Arrays.asList(REL_SUCCESS, REL_SKIPPED, REL_FAILURE)));
 
     public static final PropertyDescriptor CREDENTIALS_FILE = CredentialPropertyDescriptors.CREDENTIALS_FILE;
     public static final PropertyDescriptor ACCESS_KEY = CredentialPropertyDescriptors.ACCESS_KEY;
